@@ -1,0 +1,32 @@
+{
+  "reference_width": 1200,
+  "reference_height": 10107,
+  "target_width": 1200,
+  "target_height": 10107,
+  "reference_keypoints": 2001,
+  "target_keypoints": 2000,
+  "initial_matches": 2001,
+  "good_matches": 712,
+  "inlier_matches": 209,
+  "inlier_ratio": 29.35,
+  "reprojection_rmse": 1.6377,
+  "max_reprojection_error": 2.963,
+  "homography": [
+    [
+      0.9975093945795188,
+      0.036874280644282324,
+      -127.94053176355577
+    ],
+    [
+      -0.05007059219301189,
+      1.0587398739381404,
+      -378.65914382965934
+    ],
+    [
+      -1.3659688962905584e-05,
+      9.894770726301858e-06,
+      1.0
+    ]
+  ],
+  "processing_time_ms": 2445.59
+}
