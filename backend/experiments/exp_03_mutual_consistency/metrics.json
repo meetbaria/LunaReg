@@ -20,40 +20,40 @@
   "reference_keypoints": 2000,
   "target_keypoints": 2000,
   "initial_matches": 2000,
-  "good_matches": 670,
-  "inlier_matches": 177,
-  "inlier_ratio": 26.42,
-  "reprojection_rmse": 1.5673,
-  "median_reprojection_error": 1.3634,
-  "max_reprojection_error": 2.9783,
+  "good_matches": 680,
+  "inlier_matches": 185,
+  "inlier_ratio": 27.21,
+  "reprojection_rmse": 1.62,
+  "median_reprojection_error": 1.344,
+  "max_reprojection_error": 2.9988,
   "spatial_distribution": {
     "bbox": {
       "min_x": 55.1,
-      "min_y": 88.4,
+      "min_y": 88.1,
       "max_x": 1122.7,
-      "max_y": 2229.4,
+      "max_y": 4456.0,
       "width": 1067.6,
-      "height": 2141.0
+      "height": 4367.9
     },
-    "bbox_coverage_pct": 18.85,
-    "hull_coverage_pct": 10.72,
+    "bbox_coverage_pct": 38.45,
+    "hull_coverage_pct": 24.42,
     "grid_rows": 8,
     "grid_cols": 4,
     "total_grid_cells": 32,
-    "occupied_grid_cells": 7,
-    "grid_occupancy_ratio": 21.88,
-    "assessment": "concentrated_in_top_region",
+    "occupied_grid_cells": 8,
+    "grid_occupancy_ratio": 25.0,
+    "assessment": "concentrated_in_subregions",
     "grid_counts": [
       [
-        17,
-        20,
-        51,
-        17
+        18,
+        25,
+        58,
+        10
       ],
       [
         0,
-        11,
-        34,
+        16,
+        26,
         27
       ],
       [
@@ -63,7 +63,7 @@
         0
       ],
       [
-        0,
+        5,
         0,
         0,
         0
@@ -96,20 +96,20 @@
   },
   "homography": [
     [
-      0.9896455162413041,
-      0.04390801453682116,
-      -130.07922088017256
+      0.9964531805283846,
+      0.035787795400282166,
+      -126.8535390419678
     ],
     [
-      -0.0643321904467858,
-      1.07044339502775,
-      -381.18273063843367
+      -0.05530969205732162,
+      1.0597668074775635,
+      -378.17201608088857
     ],
     [
-      -2.3817107097730714e-05,
-      1.711324727341011e-05,
-      0.9999999999999999
+      -1.3772032322874167e-05,
+      8.81455034562353e-06,
+      1.0
     ]
   ],
-  "processing_time_ms": 2540.52
+  "processing_time_ms": 6207.63
 }

@@ -1,0 +1,15 @@
+experiment_id,status,max_features,matcher,cross_check,ratio,ransac_threshold_px,clahe_clip,initial_matches,good_matches,inlier_matches,inlier_ratio_pct,reprojection_rmse_px,median_error_px,max_error_px,occupied_cells,total_cells,grid_occupancy_pct,bbox_coverage_pct,spatial_assessment,processing_time_ms
+exp_01_baseline_flann,SUCCESS,2000,flann,False,0.75,3.0,3.0,2000,742,205,27.63,1.6605,1.5238,2.9978,9,32,28.12,26.69,concentrated_in_top_region,2684.62
+exp_02_baseline_bf,SUCCESS,2000,bf,False,0.75,3.0,3.0,2000,744,213,28.63,1.6019,1.4206,2.9839,9,32,28.12,22.87,concentrated_in_top_region,6596.85
+exp_03_mutual_consistency,SUCCESS,2000,flann,True,0.75,3.0,3.0,2000,680,185,27.21,1.62,1.344,2.9988,8,32,25.0,38.45,concentrated_in_subregions,6207.63
+exp_04_features_1000,SUCCESS,1000,flann,True,0.75,3.0,3.0,1000,307,109,35.5,1.7761,1.7217,2.9904,8,32,25.0,28.92,concentrated_in_top_region,6464.62
+exp_05_features_4000,SUCCESS,4000,flann,True,0.75,3.0,3.0,4000,1344,334,24.85,1.5473,1.241,2.9647,8,32,25.0,16.48,concentrated_in_top_region,3624.64
+exp_06_ratio_065,SUCCESS,2000,flann,True,0.65,3.0,3.0,2000,522,147,28.16,1.7731,1.4637,2.9764,10,32,31.25,33.1,concentrated_in_top_region,2586.82
+exp_07_ratio_070,SUCCESS,2000,flann,True,0.7,3.0,3.0,2000,595,168,28.24,1.5879,1.2685,2.9574,8,32,25.0,14.72,concentrated_in_top_region,2499.52
+exp_08_ratio_080,SUCCESS,2000,flann,True,0.8,3.0,3.0,2000,727,183,25.17,1.8363,1.7349,2.9901,12,32,37.5,32.79,concentrated_in_top_region,2538.07
+exp_09_ransac_15px,SUCCESS,2000,flann,True,0.75,1.5,3.0,2000,652,85,13.04,0.8171,0.7451,1.4891,10,32,31.25,32.09,concentrated_in_top_region,2581.79
+exp_10_ransac_20px,SUCCESS,2000,flann,True,0.75,2.0,3.0,2000,673,127,18.87,1.2272,1.1471,1.9825,9,32,28.12,27.67,concentrated_in_top_region,2546.5
+exp_11_ransac_50px,SUCCESS,2000,flann,True,0.75,5.0,3.0,2000,677,274,40.47,2.7992,2.3795,4.9553,13,32,40.62,34.76,concentrated_in_top_region,2509.73
+exp_12_clahe_clip20,SUCCESS,2000,flann,True,0.75,3.0,2.0,2000,740,182,24.59,1.611,1.2302,2.9934,14,32,43.75,36.7,concentrated_in_top_region,2549.23
+exp_13_clahe_clip40,SUCCESS,2000,flann,True,0.75,3.0,4.0,2001,620,183,29.52,1.596,1.3571,2.9827,8,32,25.0,37.97,concentrated_in_subregions,2508.59
+exp_14_optimal_candidate,SUCCESS,4000,flann,True,0.7,2.5,3.0,4000,1206,250,20.73,1.4222,1.2358,2.4954,17,32,53.12,64.74,moderately_distributed,2668.3

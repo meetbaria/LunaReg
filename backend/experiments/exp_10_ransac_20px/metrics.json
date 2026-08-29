@@ -3,7 +3,7 @@
   "parameters": {
     "max_features": 2000,
     "ratio_threshold": 0.75,
-    "ransac_threshold": 3.0,
+    "ransac_threshold": 2.0,
     "matcher_method": "flann",
     "cross_check": true,
     "use_clahe": true,
@@ -20,42 +20,30 @@
   "reference_keypoints": 2000,
   "target_keypoints": 2000,
   "initial_matches": 2000,
-  "good_matches": 670,
-  "inlier_matches": 177,
-  "inlier_ratio": 26.42,
-  "reprojection_rmse": 1.5673,
-  "median_reprojection_error": 1.3634,
-  "max_reprojection_error": 2.9783,
+  "good_matches": 673,
+  "inlier_matches": 127,
+  "inlier_ratio": 18.87,
+  "reprojection_rmse": 1.2272,
+  "median_reprojection_error": 1.1471,
+  "max_reprojection_error": 1.9825,
   "spatial_distribution": {
     "bbox": {
-      "min_x": 55.1,
-      "min_y": 88.4,
-      "max_x": 1122.7,
-      "max_y": 2229.4,
-      "width": 1067.6,
-      "height": 2141.0
+      "min_x": 45.9,
+      "min_y": 1467.0,
+      "max_x": 1164.6,
+      "max_y": 4466.8,
+      "width": 1118.7,
+      "height": 2999.8
     },
-    "bbox_coverage_pct": 18.85,
-    "hull_coverage_pct": 10.72,
+    "bbox_coverage_pct": 27.67,
+    "hull_coverage_pct": 18.52,
     "grid_rows": 8,
     "grid_cols": 4,
     "total_grid_cells": 32,
-    "occupied_grid_cells": 7,
-    "grid_occupancy_ratio": 21.88,
+    "occupied_grid_cells": 9,
+    "grid_occupancy_ratio": 28.12,
     "assessment": "concentrated_in_top_region",
     "grid_counts": [
-      [
-        17,
-        20,
-        51,
-        17
-      ],
-      [
-        0,
-        11,
-        34,
-        27
-      ],
       [
         0,
         0,
@@ -64,7 +52,19 @@
       ],
       [
         0,
-        0,
+        16,
+        19,
+        21
+      ],
+      [
+        15,
+        11,
+        17,
+        9
+      ],
+      [
+        10,
+        9,
         0,
         0
       ],
@@ -96,20 +96,20 @@
   },
   "homography": [
     [
-      0.9896455162413041,
-      0.04390801453682116,
-      -130.07922088017256
+      1.0201050459979377,
+      0.04007367277675455,
+      -148.28879722247382
     ],
     [
-      -0.0643321904467858,
-      1.07044339502775,
-      -381.18273063843367
+      -0.02099074579781947,
+      1.037549573938149,
+      -353.6191956263357
     ],
     [
-      -2.3817107097730714e-05,
-      1.711324727341011e-05,
+      3.259999307427333e-06,
+      4.991363106544322e-06,
       0.9999999999999999
     ]
   ],
-  "processing_time_ms": 2540.52
+  "processing_time_ms": 2546.5
 }
