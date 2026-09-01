@@ -506,9 +506,11 @@ def save_metrics(metrics: Dict[str, Any], output_path: str) -> None:
     """
     Save registration metrics to a formatted JSON file.
     """
+    clean_metrics = {k: v for k, v in metrics.items() if not isinstance(v, np.ndarray)}
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(clean_metrics, f, indent=2)
+
 
 
 def run_pipeline(
@@ -850,9 +852,504 @@ def run_benchmark_experiments(
     return results_summary
 
 
+def create_tile_overview(
+    ref_image: np.ndarray,
+    target_image: np.ndarray,
+    roi_results: List[Dict[str, Any]],
+    output_path: str,
+) -> None:
+    """
+    Generate an overview visualization of the entire lunar strip showing:
+    - Reference strip with colored bounding boxes (green for SUCCESS, red for FAILED) and metric tags
+    - Target strip with corresponding search windows
+    - Full-strip registered mosaic / alignment proof
+    - Header banner summarizing overall tile registration statistics.
+    """
+    h_ref, w_ref = ref_image.shape[:2]
+    h_tgt, w_tgt = target_image.shape[:2]
+
+    ref_bgr = ref_image if len(ref_image.shape) == 3 else cv2.cvtColor(ref_image, cv2.COLOR_GRAY2BGR)
+    tgt_bgr = target_image if len(target_image.shape) == 3 else cv2.cvtColor(target_image, cv2.COLOR_GRAY2BGR)
+
+    panel_ref = ref_bgr.copy()
+    panel_tgt = tgt_bgr.copy()
+    panel_mosaic = np.zeros((h_ref, w_ref, 3), dtype=np.uint8)
+    mosaic_counts = np.zeros((h_ref, w_ref), dtype=np.float32)
+
+    total_inliers = 0
+    successful_rois = 0
+    failed_rois = 0
+    rmses: List[float] = []
+
+    # Draw ROI annotations on reference and target panels
+    for r in roi_results:
+        status = r.get("status", "FAILED")
+        ref_y1, ref_y2 = r["ref_y1"], r["ref_y2"]
+        tgt_y1, tgt_y2 = r["tgt_y1"], r["tgt_y2"]
+        inliers = r.get("inlier_matches", 0)
+        ratio = r.get("inlier_ratio_pct", 0.0)
+        rmse = r.get("reprojection_rmse_px", 0.0)
+        roi_idx = r.get("roi_index", 1)
+
+        is_success = (status == "SUCCESS")
+        if is_success:
+            successful_rois += 1
+            total_inliers += inliers
+            rmses.append(rmse)
+            box_color = (0, 230, 40)      # Green
+            bg_color = (0, 60, 10)
+        else:
+            failed_rois += 1
+            box_color = (0, 0, 230)       # Red
+            bg_color = (60, 0, 10)
+
+        # Draw ROI box on Reference Panel
+        cv2.rectangle(panel_ref, (4, ref_y1), (w_ref - 4, ref_y2), box_color, 4)
+        
+        # Semi-transparent tag background
+        tag_h = min(120, (ref_y2 - ref_y1) // 3)
+        tag_w = w_ref - 20
+        tag_overlay = panel_ref[ref_y1 + 10:ref_y1 + 10 + tag_h, 10:10 + tag_w].copy()
+        tag_bg = np.full_like(tag_overlay, bg_color)
+        cv2.addWeighted(tag_overlay, 0.3, tag_bg, 0.7, 0, tag_overlay)
+        panel_ref[ref_y1 + 10:ref_y1 + 10 + tag_h, 10:10 + tag_w] = tag_overlay
+        cv2.rectangle(panel_ref, (10, ref_y1 + 10), (10 + tag_w, ref_y1 + 10 + tag_h), box_color, 2)
+
+        # Tag Text
+        cv2.putText(
+            panel_ref,
+            f"ROI {roi_idx:02d}: {status}",
+            (25, ref_y1 + 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            box_color,
+            2,
+            cv2.LINE_AA,
+        )
+        if is_success:
+            detail_str = f"Inliers: {inliers} ({ratio:.1f}%) | RMSE: {rmse:.2f}px | Y: {ref_y1}..{ref_y2}"
+        else:
+            detail_str = f"FAILED: {r.get('reason', 'insufficient overlap')} | Y: {ref_y1}..{ref_y2}"
+
+        cv2.putText(
+            panel_ref,
+            detail_str,
+            (25, ref_y1 + 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (230, 230, 230),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Draw search window on Target Panel
+        cv2.rectangle(panel_tgt, (4, tgt_y1), (w_tgt - 4, tgt_y2), (255, 180, 0), 3)
+        cv2.putText(
+            panel_tgt,
+            f"Tgt Search {roi_idx:02d} (Y:{tgt_y1}..{tgt_y2})",
+            (20, min(h_tgt - 20, tgt_y1 + 35)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (255, 200, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Accumulate Warped Mosaic for Successful ROIs
+        warped_roi = r.get("warped_image")
+        if is_success and warped_roi is not None:
+            roi_h = ref_y2 - ref_y1
+            panel_mosaic[ref_y1:ref_y2, :] = cv2.addWeighted(
+                ref_bgr[ref_y1:ref_y2, :], 0.5, warped_roi[:roi_h, :w_ref], 0.5, 0
+            )
+
+    # Fill unmapped mosaic areas with dim reference
+    unmapped = (panel_mosaic[:, :, 0] == 0) & (panel_mosaic[:, :, 1] == 0) & (panel_mosaic[:, :, 2] == 0)
+    panel_mosaic[unmapped] = (ref_bgr[unmapped].astype(np.float32) * 0.35).astype(np.uint8)
+
+    # Combine 3 panels side by side with gutters
+    gutter_w = 20
+    gutter = np.full((h_ref, gutter_w, 3), 30, dtype=np.uint8)
+    combined_body = np.hstack([panel_ref, gutter, panel_tgt, gutter, panel_mosaic])
+
+    # Build Header Banner
+    banner_h = 130
+    banner_w = combined_body.shape[1]
+    banner = np.zeros((banner_h, banner_w, 3), dtype=np.uint8)
+    banner[:] = (18, 18, 24)
+
+    mean_rmse_str = f"{np.mean(rmses):.2f} px" if len(rmses) > 0 else "N/A"
+    
+    cv2.putText(
+        banner,
+        "LUNAREG ROI / TILE REGISTRATION OVERVIEW (SIH26166)",
+        (30, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.1,
+        (0, 210, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        banner,
+        f"Total ROIs: {len(roi_results)}  |  Successful: {successful_rois} (Green)  |  Failed: {failed_rois} (Red)  |  Total Inliers: {total_inliers}  |  Mean Inlier RMSE: {mean_rmse_str}",
+        (30, 85),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (220, 220, 220),
+        2,
+        cv2.LINE_AA,
+    )
+
+    # Column Subheaders
+    cv2.putText(
+        banner,
+        f"PANEL 1: REFERENCE ({w_ref}x{h_ref})",
+        (30, 115),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 200, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        banner,
+        f"PANEL 2: TARGET SEARCH ({w_tgt}x{h_tgt})",
+        (w_ref + gutter_w + 30, 115),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 180, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        banner,
+        f"PANEL 3: REGISTERED OVERLAY MOSAIC",
+        (2 * (w_ref + gutter_w) + 30, 115),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 240, 100),
+        1,
+        cv2.LINE_AA,
+    )
+
+    overview = np.vstack([banner, combined_body])
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    cv2.imwrite(output_path, overview, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    print(f"Saved full-strip tile overview visualization to: {output_path}")
+
+
+def run_roi_pipeline(
+    reference_path: str,
+    target_path: str,
+    roi_height: int = 2000,
+    roi_overlap: int = 500,
+    vertical_offset: float = -380.0,
+    search_margin: int = 500,
+    max_features_per_roi: int = 1500,
+    ratio_threshold: float = 0.75,
+    ransac_threshold: float = 3.0,
+    matcher_method: str = "flann",
+    cross_check: bool = True,
+    min_inliers: int = 30,
+    min_inlier_ratio: float = 25.0,
+    max_rmse: float = 3.0,
+    min_grid_occupancy: float = 12.5,
+    output_dir: str = "backend/experiments/tiles",
+    save_visualizations: bool = True,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Execute independent local tile / ROI registration across overlapping vertical sections
+    of the lunar image strip.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    total_start = time.perf_counter()
+
+    ref_img = load_image(reference_path)
+    tgt_img = load_image(target_path)
+
+    h_ref, w_ref = ref_img.shape[:2]
+    h_tgt, w_tgt = tgt_img.shape[:2]
+
+    # Preprocessing
+    _, ref_enh, ref_mask = preprocess_image(ref_img, use_clahe=True, clip_limit=3.0)
+    _, tgt_enh, tgt_mask = preprocess_image(tgt_img, use_clahe=True, clip_limit=3.0)
+
+    # Compute overlapping vertical partitions
+    step = roi_height - roi_overlap
+    y_starts = list(range(0, h_ref - roi_overlap, step))
+    if len(y_starts) == 0 or (y_starts[-1] + roi_height < h_ref):
+        y_starts.append(max(0, h_ref - roi_height))
+
+    roi_results: List[Dict[str, Any]] = []
+
+    print(f"\n=======================================================")
+    print(f"   LunaReg SIH26166 ROI / Tile Registration Mode")
+    print(f"=======================================================")
+    print(f"Reference:       {reference_path} ({w_ref}x{h_ref})")
+    print(f"Target:          {target_path} ({w_tgt}x{h_tgt})")
+    print(f"ROI Height:      {roi_height} px | Overlap: {roi_overlap} px")
+    print(f"Vertical Offset: {vertical_offset} px | Margin: {search_margin} px")
+    print(f"Total ROIs:      {len(y_starts)}\n")
+
+    for i, ref_y1 in enumerate(y_starts, 1):
+        roi_start = time.perf_counter()
+        ref_y2 = min(h_ref, ref_y1 + roi_height)
+        cur_roi_h = ref_y2 - ref_y1
+
+        # Search window in target
+        tgt_y1 = max(0, int(round(ref_y1 - vertical_offset - search_margin)))
+        tgt_y2 = min(h_tgt, int(round(ref_y2 - vertical_offset + search_margin)))
+        cur_tgt_h = tgt_y2 - tgt_y1
+
+        roi_folder = os.path.join(output_dir, f"roi_{i:02d}")
+        os.makedirs(roi_folder, exist_ok=True)
+
+        sub_ref = ref_enh[ref_y1:ref_y2, :]
+        sub_tgt = tgt_enh[tgt_y1:tgt_y2, :]
+
+        sub_ref_mask = ref_mask[ref_y1:ref_y2, :] if ref_mask is not None else None
+        sub_tgt_mask = tgt_mask[tgt_y1:tgt_y2, :] if tgt_mask is not None else None
+
+        sub_ref_bgr = ref_img[ref_y1:ref_y2, :]
+        sub_tgt_bgr = tgt_img[tgt_y1:tgt_y2, :]
+
+        kp_ref, des_ref = detect_features(sub_ref, mask=sub_ref_mask, max_features=max_features_per_roi)
+        kp_tgt, des_tgt = detect_features(sub_tgt, mask=sub_tgt_mask, max_features=max_features_per_roi)
+
+        ref_kp_count = len(kp_ref)
+        tgt_kp_count = len(kp_tgt)
+
+        if ref_kp_count < 4 or tgt_kp_count < 4 or des_ref is None or des_tgt is None:
+            roi_time = round((time.perf_counter() - roi_start) * 1000, 2)
+            row = {
+                "roi_index": i,
+                "status": "FAILED",
+                "reason": "insufficient keypoints detected",
+                "ref_y1": ref_y1,
+                "ref_y2": ref_y2,
+                "tgt_y1": tgt_y1,
+                "tgt_y2": tgt_y2,
+                "ref_kp": ref_kp_count,
+                "tgt_kp": tgt_kp_count,
+                "initial_matches": 0,
+                "good_matches": 0,
+                "inlier_matches": 0,
+                "inlier_ratio_pct": 0.0,
+                "reprojection_rmse_px": 0.0,
+                "median_error_px": 0.0,
+                "max_error_px": 0.0,
+                "grid_occupancy_pct": 0.0,
+                "bbox_coverage_pct": 0.0,
+                "spatial_assessment": "no_inliers",
+                "homography": None,
+                "processing_time_ms": roi_time,
+                "warped_image": None,
+            }
+            roi_results.append(row)
+            save_metrics(row, os.path.join(roi_folder, "metrics.json"))
+            print(f"ROI {i:02d} (Y:{ref_y1:5d}..{ref_y2:5d}): FAILED - insufficient keypoints ({ref_kp_count}, {tgt_kp_count})")
+            continue
+
+        good_matches, init_matches_count = match_features(
+            des_ref,
+            des_tgt,
+            method=matcher_method,
+            ratio_threshold=ratio_threshold,
+            cross_check=cross_check,
+        )
+        good_count = len(good_matches)
+
+        if good_count < 4:
+            roi_time = round((time.perf_counter() - roi_start) * 1000, 2)
+            row = {
+                "roi_index": i,
+                "status": "FAILED",
+                "reason": f"insufficient correspondences ({good_count} < 4)",
+                "ref_y1": ref_y1,
+                "ref_y2": ref_y2,
+                "tgt_y1": tgt_y1,
+                "tgt_y2": tgt_y2,
+                "ref_kp": ref_kp_count,
+                "tgt_kp": tgt_kp_count,
+                "initial_matches": init_matches_count,
+                "good_matches": good_count,
+                "inlier_matches": 0,
+                "inlier_ratio_pct": 0.0,
+                "reprojection_rmse_px": 0.0,
+                "median_error_px": 0.0,
+                "max_error_px": 0.0,
+                "grid_occupancy_pct": 0.0,
+                "bbox_coverage_pct": 0.0,
+                "spatial_assessment": "insufficient_matches",
+                "homography": None,
+                "processing_time_ms": roi_time,
+                "warped_image": None,
+            }
+            roi_results.append(row)
+            save_metrics(row, os.path.join(roi_folder, "metrics.json"))
+            print(f"ROI {i:02d} (Y:{ref_y1:5d}..{ref_y2:5d}): FAILED - insufficient correspondences ({good_count})")
+            continue
+
+        H_local, inlier_mask, src_local, dst_local = estimate_homography(
+            kp_ref, kp_tgt, good_matches, ransac_threshold=ransac_threshold
+        )
+
+        if H_local is None or inlier_mask is None:
+            roi_time = round((time.perf_counter() - roi_start) * 1000, 2)
+            row = {
+                "roi_index": i,
+                "status": "FAILED",
+                "reason": "RANSAC homography estimation failed",
+                "ref_y1": ref_y1,
+                "ref_y2": ref_y2,
+                "tgt_y1": tgt_y1,
+                "tgt_y2": tgt_y2,
+                "ref_kp": ref_kp_count,
+                "tgt_kp": tgt_kp_count,
+                "initial_matches": init_matches_count,
+                "good_matches": good_count,
+                "inlier_matches": 0,
+                "inlier_ratio_pct": 0.0,
+                "reprojection_rmse_px": 0.0,
+                "median_error_px": 0.0,
+                "max_error_px": 0.0,
+                "grid_occupancy_pct": 0.0,
+                "bbox_coverage_pct": 0.0,
+                "spatial_assessment": "ransac_failed",
+                "homography": None,
+                "processing_time_ms": roi_time,
+                "warped_image": None,
+            }
+            roi_results.append(row)
+            save_metrics(row, os.path.join(roi_folder, "metrics.json"))
+            print(f"ROI {i:02d} (Y:{ref_y1:5d}..{ref_y2:5d}): FAILED - RANSAC failed")
+            continue
+
+        inliers_count = int(np.sum(inlier_mask))
+        inlier_ratio = round((inliers_count / good_count) * 100.0, 2) if good_count > 0 else 0.0
+
+        rmse, med_err, max_err, _ = calculate_reprojection_error(src_local, dst_local, H_local, inlier_mask)
+
+        inlier_bool = inlier_mask.astype(bool)
+        inlier_pts_local = dst_local[inlier_bool].reshape(-1, 2)
+        spatial_analysis = analyze_spatial_distribution(inlier_pts_local, w_ref, cur_roi_h, grid_rows=4, grid_cols=4)
+        grid_occ = spatial_analysis.get("grid_occupancy_ratio", 0.0)
+
+        # Check Usability Criteria
+        if inliers_count < min_inliers:
+            status = "FAILED"
+            reason = f"insufficient inliers ({inliers_count} < {min_inliers})"
+        elif inlier_ratio < min_inlier_ratio:
+            status = "FAILED"
+            reason = f"low inlier ratio ({inlier_ratio:.1f}% < {min_inlier_ratio:.1f}%)"
+        elif rmse > max_rmse:
+            status = "FAILED"
+            reason = f"high reprojection error ({rmse:.2f}px > {max_rmse:.2f}px)"
+        elif grid_occ < min_grid_occupancy:
+            status = "FAILED"
+            reason = f"concentrated in tiny area ({grid_occ:.1f}%)"
+        else:
+            status = "SUCCESS"
+            reason = "passed all usability criteria"
+
+        # Local Warping & Visualizations
+        warped_sub_tgt = warp_image(sub_tgt_bgr, H_local, (w_ref, cur_roi_h))
+
+        if save_visualizations:
+            matches_vis = create_match_visualization(
+                sub_ref_bgr, sub_tgt_bgr, kp_ref, kp_tgt, good_matches, inlier_mask, spatial_info=spatial_analysis, rmse=rmse
+            )
+            overlay_vis = create_overlay(sub_ref_bgr, warped_sub_tgt, alpha=0.5)
+            diff_vis = create_difference_image(sub_ref_bgr, warped_sub_tgt)
+
+            cv2.imwrite(os.path.join(roi_folder, "matches.jpg"), matches_vis, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            cv2.imwrite(os.path.join(roi_folder, "registered.jpg"), warped_sub_tgt, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            cv2.imwrite(os.path.join(roi_folder, "overlay.jpg"), overlay_vis, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            cv2.imwrite(os.path.join(roi_folder, "difference.jpg"), diff_vis, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        roi_time = round((time.perf_counter() - roi_start) * 1000, 2)
+
+        row = {
+            "roi_index": i,
+            "status": status,
+            "reason": reason,
+            "ref_y1": ref_y1,
+            "ref_y2": ref_y2,
+            "tgt_y1": tgt_y1,
+            "tgt_y2": tgt_y2,
+            "ref_kp": ref_kp_count,
+            "tgt_kp": tgt_kp_count,
+            "initial_matches": init_matches_count,
+            "good_matches": good_count,
+            "inlier_matches": inliers_count,
+            "inlier_ratio_pct": inlier_ratio,
+            "reprojection_rmse_px": round(rmse, 4),
+            "median_error_px": round(med_err, 4),
+            "max_error_px": round(max_err, 4),
+            "grid_occupancy_pct": grid_occ,
+            "bbox_coverage_pct": spatial_analysis.get("bbox_coverage_pct", 0.0),
+            "spatial_assessment": spatial_analysis.get("assessment", "unknown"),
+            "homography": H_local.tolist() if H_local is not None else None,
+            "processing_time_ms": roi_time,
+            "warped_image": warped_sub_tgt,
+        }
+        roi_results.append(row)
+        save_metrics(row, os.path.join(roi_folder, "metrics.json"))
+
+        status_tag = f"SUCCESS ({inliers_count} inliers, {inlier_ratio:.1f}%, RMSE: {rmse:.2f}px)" if status == "SUCCESS" else f"FAILED - {reason}"
+        print(f"ROI {i:02d} (Y:{ref_y1:5d}..{ref_y2:5d}): {status_tag}")
+
+    # Write summary CSV
+    csv_path = os.path.join(output_dir, "roi_summary.csv")
+    csv_rows = []
+    for r in roi_results:
+        clean_row = {k: v for k, v in r.items() if k != "warped_image"}
+        csv_rows.append(clean_row)
+
+    if len(csv_rows) > 0:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        print(f"\nSaved ROI summary CSV to: {csv_path}")
+
+    # Create Full-Strip Tile Overview Image
+    overview_path = os.path.join(output_dir, "tile_overview.jpg")
+    create_tile_overview(ref_img, tgt_img, roi_results, overview_path)
+
+    total_time_ms = round((time.perf_counter() - total_start) * 1000, 2)
+    successful_count = sum(1 for r in roi_results if r["status"] == "SUCCESS")
+    total_inliers = sum(r.get("inlier_matches", 0) for r in roi_results if r["status"] == "SUCCESS")
+
+    successful_rois_list = [r for r in roi_results if r["status"] == "SUCCESS"]
+    best_roi = max(successful_rois_list, key=lambda x: x["inlier_matches"]) if len(successful_rois_list) > 0 else None
+    best_rmse_roi = min(successful_rois_list, key=lambda x: x["reprojection_rmse_px"]) if len(successful_rois_list) > 0 else None
+
+    summary = {
+        "total_rois": len(roi_results),
+        "successful_rois": successful_count,
+        "failed_rois": len(roi_results) - successful_count,
+        "total_inliers": total_inliers,
+        "best_roi": f"ROI {best_roi['roi_index']:02d}" if best_roi else "None",
+        "best_rmse": best_rmse_roi["reprojection_rmse_px"] if best_rmse_roi else 0.0,
+        "best_inlier_ratio": best_roi["inlier_ratio_pct"] if best_roi else 0.0,
+        "total_processing_time_ms": total_time_ms,
+    }
+
+    return summary, roi_results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="LunaReg Standalone Computer-Vision Registration Engine (SIH26166)"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="global",
+        choices=["global", "roi", "tiles"],
+        help="Registration mode: 'global' for full-image or 'roi'/'tiles' for multi-tile registration (default: global)",
     )
     parser.add_argument(
         "--reference",
@@ -882,7 +1379,7 @@ def main() -> None:
         "--max-features",
         type=int,
         default=2000,
-        help="Maximum SIFT keypoints to detect per image (default: 2000)",
+        help="Maximum SIFT keypoints to detect per image/ROI (default: 2000)",
     )
     parser.add_argument(
         "--matcher",
@@ -927,8 +1424,53 @@ def main() -> None:
         help="Directory for saving benchmark experiment outputs (default: backend/experiments)",
     )
 
+    # ROI / Tile Mode specific arguments
+    parser.add_argument(
+        "--roi-height",
+        type=int,
+        default=2000,
+        help="Height of horizontal ROIs in pixels (default: 2000)",
+    )
+    parser.add_argument(
+        "--roi-overlap",
+        type=int,
+        default=500,
+        help="Overlap between adjacent ROIs in pixels (default: 500)",
+    )
+    parser.add_argument(
+        "--vertical-offset",
+        type=float,
+        default=-380.0,
+        help="Estimated vertical displacement offset in pixels (default: -380.0)",
+    )
+    parser.add_argument(
+        "--search-margin",
+        type=int,
+        default=500,
+        help="Target search margin around estimated offset in pixels (default: 500)",
+    )
+    parser.add_argument(
+        "--min-inliers",
+        type=int,
+        default=30,
+        help="Minimum inliers required for usable ROI registration (default: 30)",
+    )
+    parser.add_argument(
+        "--min-inlier-ratio",
+        type=float,
+        default=25.0,
+        help="Minimum inlier ratio %% for usable ROI registration (default: 25.0)",
+    )
+    parser.add_argument(
+        "--max-rmse",
+        type=float,
+        default=3.0,
+        help="Maximum allowable reprojection RMSE for usable ROI registration (default: 3.0)",
+    )
+
     args = parser.parse_args()
 
+    # Benchmark mode
     if args.run_benchmark:
         run_benchmark_experiments(
             reference_path=args.reference,
@@ -937,6 +1479,53 @@ def main() -> None:
         )
         return
 
+    # ROI / Tiles Mode
+    if args.mode.lower() in ["roi", "tiles"]:
+        summary, roi_results = run_roi_pipeline(
+            reference_path=args.reference,
+            target_path=args.target,
+            roi_height=args.roi_height,
+            roi_overlap=args.roi_overlap,
+            vertical_offset=args.vertical_offset,
+            search_margin=args.search_margin,
+            max_features_per_roi=args.max_features,
+            ratio_threshold=args.ratio,
+            ransac_threshold=args.ransac_threshold,
+            matcher_method=args.matcher,
+            cross_check=args.cross_check,
+            min_inliers=args.min_inliers,
+            min_inlier_ratio=args.min_inlier_ratio,
+            max_rmse=args.max_rmse,
+            output_dir=os.path.join(args.benchmark_dir, "tiles") if args.output_dir == "backend/output" else args.output_dir,
+            save_visualizations=True,
+        )
+
+        print("\n=======================================================")
+        print("ROI Registration Summary")
+        print("-------------------------------------------------------")
+        for r in roi_results:
+            idx = r["roi_index"]
+            st = r["status"]
+            y1, y2 = r["ref_y1"], r["ref_y2"]
+            if st == "SUCCESS":
+                inl = r["inlier_matches"]
+                rat = r["inlier_ratio_pct"]
+                err = r["reprojection_rmse_px"]
+                print(f"ROI {idx:02d} (Y:{y1:5d}..{y2:5d}): SUCCESS ({inl} inliers, {rat:.1f}%, RMSE: {err:.2f}px)")
+            else:
+                rsn = r.get("reason", "failed")
+                print(f"ROI {idx:02d} (Y:{y1:5d}..{y2:5d}): FAILED - {rsn}")
+
+        print("-------------------------------------------------------")
+        print(f"Successful ROIs:     {summary['successful_rois']} / {summary['total_rois']}")
+        print(f"Total local inliers: {summary['total_inliers']}")
+        print(f"Best ROI:            {summary['best_roi']}")
+        print(f"Best RMSE:           {summary['best_rmse']:.2f} px")
+        print(f"Best inlier ratio:   {summary['best_inlier_ratio']:.1f}%")
+        print(f"Total time:          {summary['total_processing_time_ms']:.1f} ms\n")
+        return
+
+    # Global mode
     try:
         success, metrics = run_pipeline(
             reference_path=args.reference,

@@ -1,0 +1,39 @@
+{
+  "roi_index": 3,
+  "status": "SUCCESS",
+  "reason": "passed all usability criteria",
+  "ref_y1": 3000,
+  "ref_y2": 5000,
+  "tgt_y1": 2880,
+  "tgt_y2": 5880,
+  "ref_kp": 2000,
+  "tgt_kp": 2000,
+  "initial_matches": 2000,
+  "good_matches": 591,
+  "inlier_matches": 587,
+  "inlier_ratio_pct": 99.32,
+  "reprojection_rmse_px": 0.7313,
+  "median_error_px": 0.5354,
+  "max_error_px": 2.1723,
+  "grid_occupancy_pct": 87.5,
+  "bbox_coverage_pct": 70.37,
+  "spatial_assessment": "widely_distributed",
+  "homography": [
+    [
+      0.9856765868554943,
+      0.053426200115178936,
+      102.97882833025591
+    ],
+    [
+      -0.06828998661257006,
+      0.9956334084524561,
+      -336.4603225502085
+    ],
+    [
+      7.571482733492323e-07,
+      -6.802896204960699e-08,
+      1.0
+    ]
+  ],
+  "processing_time_ms": 641.54
+}
