@@ -867,14 +867,17 @@ def create_tile_overview(
     """
     h_ref, w_ref = ref_image.shape[:2]
     h_tgt, w_tgt = target_image.shape[:2]
+    max_h = max(h_ref, h_tgt)
 
     ref_bgr = ref_image if len(ref_image.shape) == 3 else cv2.cvtColor(ref_image, cv2.COLOR_GRAY2BGR)
     tgt_bgr = target_image if len(target_image.shape) == 3 else cv2.cvtColor(target_image, cv2.COLOR_GRAY2BGR)
 
-    panel_ref = ref_bgr.copy()
-    panel_tgt = tgt_bgr.copy()
-    panel_mosaic = np.zeros((h_ref, w_ref, 3), dtype=np.uint8)
-    mosaic_counts = np.zeros((h_ref, w_ref), dtype=np.float32)
+    panel_ref = np.zeros((max_h, w_ref, 3), dtype=np.uint8)
+    panel_tgt = np.zeros((max_h, w_tgt, 3), dtype=np.uint8)
+    panel_mosaic = np.zeros((max_h, w_ref, 3), dtype=np.uint8)
+
+    panel_ref[:h_ref, :w_ref] = ref_bgr
+    panel_tgt[:h_tgt, :w_tgt] = tgt_bgr
 
     total_inliers = 0
     successful_rois = 0
@@ -960,16 +963,16 @@ def create_tile_overview(
         if is_success and warped_roi is not None:
             roi_h = ref_y2 - ref_y1
             panel_mosaic[ref_y1:ref_y2, :] = cv2.addWeighted(
-                ref_bgr[ref_y1:ref_y2, :], 0.5, warped_roi[:roi_h, :w_ref], 0.5, 0
+                panel_ref[ref_y1:ref_y2, :], 0.5, warped_roi[:roi_h, :w_ref], 0.5, 0
             )
 
     # Fill unmapped mosaic areas with dim reference
-    unmapped = (panel_mosaic[:, :, 0] == 0) & (panel_mosaic[:, :, 1] == 0) & (panel_mosaic[:, :, 2] == 0)
-    panel_mosaic[unmapped] = (ref_bgr[unmapped].astype(np.float32) * 0.35).astype(np.uint8)
+    unmapped = (panel_mosaic[:h_ref, :w_ref, 0] == 0) & (panel_mosaic[:h_ref, :w_ref, 1] == 0) & (panel_mosaic[:h_ref, :w_ref, 2] == 0)
+    panel_mosaic[:h_ref, :w_ref][unmapped] = (panel_ref[:h_ref, :w_ref][unmapped].astype(np.float32) * 0.35).astype(np.uint8)
 
     # Combine 3 panels side by side with gutters
     gutter_w = 20
-    gutter = np.full((h_ref, gutter_w, 3), 30, dtype=np.uint8)
+    gutter = np.full((max_h, gutter_w, 3), 30, dtype=np.uint8)
     combined_body = np.hstack([panel_ref, gutter, panel_tgt, gutter, panel_mosaic])
 
     # Build Header Banner
@@ -1337,7 +1340,588 @@ def run_roi_pipeline(
         "total_processing_time_ms": total_time_ms,
     }
 
-    return summary, roi_results
+def validate_homography_geometry(
+    H: Optional[np.ndarray], H_global: Optional[np.ndarray] = None
+) -> Tuple[bool, str]:
+    """
+    Perform rigorous geometric sanity checks on estimated local homographies
+    to reject degenerate, inverted, or implausibly distorted transformations.
+    """
+    if H is None:
+        return False, "homography is None"
+
+    # 1. Invertibility & Determinant
+    det = float(np.linalg.det(H))
+    if not np.isfinite(det) or abs(det) < 1e-7 or det <= 0:
+        return False, f"degenerate or inverted determinant ({det:.2e})"
+
+    # 2. Scale & Singular values of affine part
+    affine_2x2 = H[0:2, 0:2]
+    try:
+        s1, s2 = np.linalg.svd(affine_2x2, compute_uv=False)
+    except Exception:
+        return False, "SVD calculation failed on homography"
+
+    if s1 < 0.65 or s1 > 1.50 or s2 < 0.65 or s2 > 1.50:
+        return False, f"extreme scale factor (s1={s1:.2f}, s2={s2:.2f})"
+
+    aspect_ratio = float(s1 / max(1e-6, s2))
+    if aspect_ratio < 0.65 or aspect_ratio > 1.55:
+        return False, f"extreme aspect ratio stretching ({aspect_ratio:.2f})"
+
+    # 3. Perspective distortion (H20, H21)
+    p_norm = float(np.linalg.norm(H[2, 0:2]))
+    if p_norm > 0.005:
+        return False, f"extreme perspective distortion ({p_norm:.2e})"
+
+    # 4. Rotation comparison with global initialization
+    if H_global is not None:
+        rot_local = float(np.arctan2(H[0, 1] - H[1, 0], H[0, 0] + H[1, 1]) * (180.0 / np.pi))
+        rot_global = float(np.arctan2(H_global[0, 1] - H_global[1, 0], H_global[0, 0] + H_global[1, 1]) * (180.0 / np.pi))
+        rot_diff = abs(rot_local - rot_global)
+        if rot_diff > 14.0:
+            return False, f"implausible rotation jump ({rot_diff:.1f} deg relative to global)"
+
+    return True, "valid"
+
+
+def evaluate_continuity(roi_results: List[Dict[str, Any]], image_width: int = 1200) -> Dict[str, Any]:
+    """
+    Evaluate geometric transformation continuity across neighboring local ROIs
+    by measuring rotation consistency and overlap seam displacement.
+    """
+    successful = [r for r in roi_results if r.get("status") == "SUCCESS" and r.get("homography") is not None]
+    if len(successful) < 2:
+        return {
+            "neighboring_homography_consistency": "insufficient_rois" if len(successful) == 0 else "single_roi",
+            "max_translation_jump_px": 0.0,
+            "max_rotation_jump_deg": 0.0,
+            "suspicious_rois": [],
+        }
+
+    suspicious_rois: List[int] = []
+    max_seam_jump = 0.0
+    max_rot_jump = 0.0
+
+    for i in range(len(successful) - 1):
+        r1, r2 = successful[i], successful[i + 1]
+        H1 = np.array(r1["homography"], dtype=np.float64)
+        H2 = np.array(r2["homography"], dtype=np.float64)
+
+        # Convert local homographies to global coordinate systems
+        S_ref1 = np.array([[1, 0, 0], [0, 1, r1["ref_y1"]], [0, 0, 1]], dtype=np.float64)
+        S_tgt1_inv = np.array([[1, 0, 0], [0, 1, -r1["tgt_y1"]], [0, 0, 1]], dtype=np.float64)
+        G1 = S_ref1 @ H1 @ S_tgt1_inv
+
+        S_ref2 = np.array([[1, 0, 0], [0, 1, r2["ref_y1"]], [0, 0, 1]], dtype=np.float64)
+        S_tgt2_inv = np.array([[1, 0, 0], [0, 1, -r2["tgt_y1"]], [0, 0, 1]], dtype=np.float64)
+        G2 = S_ref2 @ H2 @ S_tgt2_inv
+
+        rot1 = float(np.arctan2(G1[0, 1] - G1[1, 0], G1[0, 0] + G1[1, 1]) * (180.0 / np.pi))
+        rot2 = float(np.arctan2(G2[0, 1] - G2[1, 0], G2[0, 0] + G2[1, 1]) * (180.0 / np.pi))
+        d_rot = abs(rot2 - rot1)
+        max_rot_jump = max(max_rot_jump, d_rot)
+
+        # Evaluate overlap seam displacement across the boundary center line
+        y_overlap = (r2["ref_y1"] + r1["ref_y2"]) / 2.0
+        pts_ref = np.array([[[image_width * 0.2, y_overlap], [image_width * 0.5, y_overlap], [image_width * 0.8, y_overlap]]], dtype=np.float32)
+
+        try:
+            G1_inv = np.linalg.inv(G1)
+            G2_inv = np.linalg.inv(G2)
+            p1 = cv2.perspectiveTransform(pts_ref, G1_inv)[0]
+            p2 = cv2.perspectiveTransform(pts_ref, G2_inv)[0]
+            dists = np.linalg.norm(p1 - p2, axis=1)
+            seam_disp = float(np.max(dists))
+        except Exception:
+            seam_disp = 999.0
+
+        max_seam_jump = max(max_seam_jump, seam_disp)
+
+        if seam_disp > 180.0 or d_rot > 6.0:
+            suspicious_rois.append(r2["roi_index"])
+
+    if len(suspicious_rois) == 0 and max_rot_jump < 4.0 and max_seam_jump < 140.0:
+        consistency = "smooth"
+    elif len(suspicious_rois) == 0:
+        consistency = "moderately_consistent"
+    else:
+        consistency = "discontinuous"
+
+    return {
+        "neighboring_homography_consistency": consistency,
+        "max_translation_jump_px": round(float(max_seam_jump), 2),
+        "max_rotation_jump_deg": round(float(max_rot_jump), 2),
+        "suspicious_rois": suspicious_rois,
+    }
+
+
+
+def blend_overlapping_rois(
+    roi_list: List[Dict[str, Any]], full_h: int, full_w: int, default_overlap: int = 500
+) -> np.ndarray:
+    """
+    Seamlessly stitch overlapping warped ROI images using vertical linear cross-fade blending.
+    """
+    accum_img = np.zeros((full_h, full_w, 3), dtype=np.float32)
+    accum_weight = np.zeros((full_h, full_w, 1), dtype=np.float32)
+
+    for r in roi_list:
+        if r.get("status") != "SUCCESS" or r.get("warped_image") is None:
+            continue
+        ref_y1, ref_y2 = r["ref_y1"], r["ref_y2"]
+        cur_roi_h = ref_y2 - ref_y1
+        img = r["warped_image"][:cur_roi_h, :full_w].astype(np.float32)
+
+        valid = (np.sum(img, axis=2, keepdims=True) > 0).astype(np.float32)
+        if np.sum(valid) == 0:
+            continue
+
+        ramp = np.ones((cur_roi_h, full_w, 1), dtype=np.float32)
+        fade_len = min(default_overlap, cur_roi_h // 2)
+
+        if ref_y1 > 0 and fade_len > 0:
+            ramp[:fade_len, :, 0] = np.linspace(0.0, 1.0, fade_len)[:, None]
+        if ref_y2 < full_h and fade_len > 0:
+            ramp[-fade_len:, :, 0] = np.linspace(1.0, 0.0, fade_len)[:, None]
+
+        w_eff = ramp * valid
+        accum_img[ref_y1:ref_y2, :] += img * w_eff
+        accum_weight[ref_y1:ref_y2, :] += w_eff
+
+    mask = accum_weight > 0
+    final_img = np.zeros((full_h, full_w, 3), dtype=np.uint8)
+    final_img[mask[:, :, 0]] = np.clip(
+        accum_img[mask[:, :, 0]] / accum_weight[mask[:, :, 0]], 0, 255
+    ).astype(np.uint8)
+    return final_img
+
+
+def run_hybrid_pipeline(
+    reference_path: str,
+    target_path: str,
+    roi_height: int = 2000,
+    roi_overlap: int = 500,
+    search_margin: int = 500,
+    max_features_global: int = 2000,
+    max_features_roi: int = 1500,
+    ratio_threshold: float = 0.75,
+    ransac_threshold: float = 3.0,
+    matcher_method: str = "flann",
+    cross_check: bool = True,
+    min_inliers: int = 30,
+    min_inlier_ratio: float = 25.0,
+    max_rmse: float = 3.0,
+    min_grid_occupancy: float = 12.5,
+    output_dir: str = "output/hybrid",
+    save_visualizations: bool = True,
+) -> Tuple[bool, Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Execute the Production Hybrid Registration Pipeline:
+    1. Global SIFT coarse alignment & dynamic displacement estimation.
+    2. Dynamic overlapping ROI generation and target search window assignment.
+    3. Independent local multi-tile feature extraction, matching, and geometric verification.
+    4. Transformation continuity & geometric sanity checks.
+    5. Overlapping linear cross-fade mosaic blending.
+    6. Complete quantitative metrics export.
+    """
+    total_start = time.perf_counter()
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\n=======================================================")
+    print(f"   LunaReg SIH26166 Hybrid Registration Pipeline")
+    print(f"=======================================================\n")
+    print(f"Reference: {reference_path}")
+    print(f"Target:    {target_path}")
+    print(f"Output:    {output_dir}/\n")
+
+    # 1. Load Images
+    ref_img = load_image(reference_path)
+    tgt_img = load_image(target_path)
+    h_ref, w_ref = ref_img.shape[:2]
+    h_tgt, w_tgt = tgt_img.shape[:2]
+
+    # Preprocessing
+    _, ref_enh, ref_mask = preprocess_image(ref_img, use_clahe=True, clip_limit=3.0)
+    _, tgt_enh, tgt_mask = preprocess_image(tgt_img, use_clahe=True, clip_limit=3.0)
+
+    # 2. Global Coarse Initialization
+    print("[1/4] Running global coarse initialization ...", flush=True)
+    kp_ref_g, des_ref_g = detect_features(ref_enh, mask=ref_mask, max_features=max_features_global)
+    kp_tgt_g, des_tgt_g = detect_features(tgt_enh, mask=tgt_mask, max_features=max_features_global)
+
+    good_matches_g, _ = match_features(
+        des_ref_g, des_tgt_g, method=matcher_method, ratio_threshold=ratio_threshold, cross_check=cross_check
+    )
+
+    H_global = None
+    inliers_g_count = 0
+    inlier_ratio_g = 0.0
+    rmse_g = 0.0
+    med_dy = -380.0
+    med_dx = 0.0
+
+    if len(good_matches_g) >= 4:
+        H_global, inlier_mask_g, src_g, dst_g = estimate_homography(
+            kp_ref_g, kp_tgt_g, good_matches_g, ransac_threshold=ransac_threshold
+        )
+        if H_global is not None and inlier_mask_g is not None:
+            inliers_g_count = int(np.sum(inlier_mask_g))
+            inlier_ratio_g = round((inliers_g_count / len(good_matches_g)) * 100.0, 2)
+            rmse_g, _, _, _ = calculate_reprojection_error(src_g, dst_g, H_global, inlier_mask_g)
+            inlier_bool_g = inlier_mask_g.astype(bool)
+            inlier_src_g = src_g[inlier_bool_g].reshape(-1, 2)
+            inlier_dst_g = dst_g[inlier_bool_g].reshape(-1, 2)
+            dy_vals = inlier_dst_g[:, 1] - inlier_src_g[:, 1]
+            dx_vals = inlier_dst_g[:, 0] - inlier_src_g[:, 0]
+            if len(dy_vals) > 0:
+                med_dy = float(np.median(dy_vals))
+                med_dx = float(np.median(dx_vals))
+
+    global_init_status = "SUCCESS" if (H_global is not None and inliers_g_count >= 30) else "FAILED"
+    print(f"      Global status: {global_init_status} ({inliers_g_count} inliers, {inlier_ratio_g}%, RMSE: {rmse_g:.2f}px, dy: {med_dy:.1f}px)")
+
+    # Prepare H_inv for dynamic search window projection
+    H_inv = None
+    if H_global is not None:
+        try:
+            H_inv = np.linalg.inv(H_global)
+        except Exception:
+            H_inv = None
+
+    # 3. Dynamic ROI Partitioning & Target Window Assignment
+    print("\n[2/4] Executing local multi-tile registration ...", flush=True)
+    step = roi_height - roi_overlap
+    y_starts = list(range(0, h_ref - roi_overlap, step))
+    if len(y_starts) == 0 or (y_starts[-1] + roi_height < h_ref):
+        y_starts.append(max(0, h_ref - roi_height))
+
+    roi_results: List[Dict[str, Any]] = []
+    all_inlier_pts_ref: List[np.ndarray] = []
+
+    for i, ref_y1 in enumerate(y_starts, 1):
+        roi_start = time.perf_counter()
+        ref_y2 = min(h_ref, ref_y1 + roi_height)
+        cur_roi_h = ref_y2 - ref_y1
+
+        # Dynamic target window calculation
+        if H_inv is not None:
+            pts_ref = np.array([[[0, ref_y1], [w_ref, ref_y1], [0, ref_y2], [w_ref, ref_y2]]], dtype=np.float32)
+            pts_tgt = cv2.perspectiveTransform(pts_ref, H_inv)[0]
+            min_tgt_y = float(np.min(pts_tgt[:, 1]))
+            max_tgt_y = float(np.max(pts_tgt[:, 1]))
+            tgt_y1 = max(0, int(round(min_tgt_y - search_margin)))
+            tgt_y2 = min(h_tgt, int(round(max_tgt_y + search_margin)))
+        else:
+            tgt_y1 = max(0, int(round(ref_y1 - med_dy - search_margin)))
+            tgt_y2 = min(h_tgt, int(round(ref_y2 - med_dy + search_margin)))
+
+        sub_ref = ref_enh[ref_y1:ref_y2, :]
+        sub_tgt = tgt_enh[tgt_y1:tgt_y2, :]
+        sub_ref_mask = ref_mask[ref_y1:ref_y2, :] if ref_mask is not None else None
+        sub_tgt_mask = tgt_mask[tgt_y1:tgt_y2, :] if tgt_mask is not None else None
+        sub_ref_bgr = ref_img[ref_y1:ref_y2, :]
+        sub_tgt_bgr = tgt_img[tgt_y1:tgt_y2, :]
+
+        kp_ref_l, des_ref_l = detect_features(sub_ref, mask=sub_ref_mask, max_features=max_features_roi)
+        kp_tgt_l, des_tgt_l = detect_features(sub_tgt, mask=sub_tgt_mask, max_features=max_features_roi)
+
+        ref_kp_count = len(kp_ref_l)
+        tgt_kp_count = len(kp_tgt_l)
+
+        if ref_kp_count < 4 or tgt_kp_count < 4 or des_ref_l is None or des_tgt_l is None:
+            roi_time = round((time.perf_counter() - roi_start) * 1000, 2)
+            row = {
+                "roi_index": i,
+                "status": "FAILED",
+                "reason": "insufficient keypoints detected",
+                "ref_y1": ref_y1,
+                "ref_y2": ref_y2,
+                "tgt_y1": tgt_y1,
+                "tgt_y2": tgt_y2,
+                "ref_kp": ref_kp_count,
+                "tgt_kp": tgt_kp_count,
+                "initial_matches": 0,
+                "good_matches": 0,
+                "inlier_matches": 0,
+                "inlier_ratio_pct": 0.0,
+                "reprojection_rmse_px": 0.0,
+                "median_error_px": 0.0,
+                "max_error_px": 0.0,
+                "grid_occupancy_pct": 0.0,
+                "bbox_coverage_pct": 0.0,
+                "spatial_assessment": "no_inliers",
+                "homography": None,
+                "processing_time_ms": roi_time,
+                "warped_image": None,
+            }
+            roi_results.append(row)
+            print(f"      ROI {i:02d} (Y:{ref_y1:5d}..{ref_y2:5d}): FAILED - insufficient keypoints")
+            continue
+
+        good_matches_l, init_count_l = match_features(
+            des_ref_l, des_tgt_l, method=matcher_method, ratio_threshold=ratio_threshold, cross_check=cross_check
+        )
+        good_count_l = len(good_matches_l)
+
+        if good_count_l < 4:
+            roi_time = round((time.perf_counter() - roi_start) * 1000, 2)
+            row = {
+                "roi_index": i,
+                "status": "FAILED",
+                "reason": f"insufficient correspondences ({good_count_l} < 4)",
+                "ref_y1": ref_y1,
+                "ref_y2": ref_y2,
+                "tgt_y1": tgt_y1,
+                "tgt_y2": tgt_y2,
+                "ref_kp": ref_kp_count,
+                "tgt_kp": tgt_kp_count,
+                "initial_matches": init_count_l,
+                "good_matches": good_count_l,
+                "inlier_matches": 0,
+                "inlier_ratio_pct": 0.0,
+                "reprojection_rmse_px": 0.0,
+                "median_error_px": 0.0,
+                "max_error_px": 0.0,
+                "grid_occupancy_pct": 0.0,
+                "bbox_coverage_pct": 0.0,
+                "spatial_assessment": "insufficient_matches",
+                "homography": None,
+                "processing_time_ms": roi_time,
+                "warped_image": None,
+            }
+            roi_results.append(row)
+            print(f"      ROI {i:02d} (Y:{ref_y1:5d}..{ref_y2:5d}): FAILED - insufficient correspondences")
+            continue
+
+        H_local, inlier_mask_l, src_l, dst_l = estimate_homography(
+            kp_ref_l, kp_tgt_l, good_matches_l, ransac_threshold=ransac_threshold
+        )
+
+        # Geometric sanity check
+        is_geom_valid, geom_reason = validate_homography_geometry(H_local, H_global=H_global)
+
+        if H_local is None or inlier_mask_l is None or not is_geom_valid:
+            roi_time = round((time.perf_counter() - roi_start) * 1000, 2)
+            fail_reason = geom_reason if not is_geom_valid else "RANSAC homography estimation failed"
+            row = {
+                "roi_index": i,
+                "status": "FAILED",
+                "reason": fail_reason,
+                "ref_y1": ref_y1,
+                "ref_y2": ref_y2,
+                "tgt_y1": tgt_y1,
+                "tgt_y2": tgt_y2,
+                "ref_kp": ref_kp_count,
+                "tgt_kp": tgt_kp_count,
+                "initial_matches": init_count_l,
+                "good_matches": good_count_l,
+                "inlier_matches": 0,
+                "inlier_ratio_pct": 0.0,
+                "reprojection_rmse_px": 0.0,
+                "median_error_px": 0.0,
+                "max_error_px": 0.0,
+                "grid_occupancy_pct": 0.0,
+                "bbox_coverage_pct": 0.0,
+                "spatial_assessment": "geometric_failure",
+                "homography": None,
+                "processing_time_ms": roi_time,
+                "warped_image": None,
+            }
+            roi_results.append(row)
+            print(f"      ROI {i:02d} (Y:{ref_y1:5d}..{ref_y2:5d}): FAILED - {fail_reason}")
+            continue
+
+        inliers_count_l = int(np.sum(inlier_mask_l))
+        inlier_ratio_l = round((inliers_count_l / good_count_l) * 100.0, 2) if good_count_l > 0 else 0.0
+        rmse_l, med_err_l, max_err_l, _ = calculate_reprojection_error(src_l, dst_l, H_local, inlier_mask_l)
+
+        inlier_bool_l = inlier_mask_l.astype(bool)
+        inlier_pts_local = dst_l[inlier_bool_l].reshape(-1, 2)
+        spatial_analysis = analyze_spatial_distribution(inlier_pts_local, w_ref, cur_roi_h, grid_rows=4, grid_cols=4)
+        grid_occ = spatial_analysis.get("grid_occupancy_ratio", 0.0)
+
+        # Quality Gates
+        if inliers_count_l < min_inliers:
+            status = "FAILED"
+            reason = f"insufficient inliers ({inliers_count_l} < {min_inliers})"
+        elif inlier_ratio_l < min_inlier_ratio:
+            status = "FAILED"
+            reason = f"low inlier ratio ({inlier_ratio_l:.1f}% < {min_inlier_ratio:.1f}%)"
+        elif rmse_l > max_rmse:
+            status = "FAILED"
+            reason = f"high reprojection RMSE ({rmse_l:.2f}px > {max_rmse:.2f}px)"
+        elif grid_occ < min_grid_occupancy:
+            status = "FAILED"
+            reason = f"concentrated in tiny area ({grid_occ:.1f}%)"
+        else:
+            status = "SUCCESS"
+            reason = "passed all quality criteria"
+
+        warped_sub_tgt = warp_image(sub_tgt_bgr, H_local, (w_ref, cur_roi_h))
+        roi_time = round((time.perf_counter() - roi_start) * 1000, 2)
+
+        # Collect global coordinate inliers for full-strip spatial metrics
+        if status == "SUCCESS":
+            inlier_global = inlier_pts_local.copy()
+            inlier_global[:, 1] += ref_y1
+            all_inlier_pts_ref.append(inlier_global)
+
+        row = {
+            "roi_index": i,
+            "status": status,
+            "reason": reason,
+            "ref_y1": ref_y1,
+            "ref_y2": ref_y2,
+            "tgt_y1": tgt_y1,
+            "tgt_y2": tgt_y2,
+            "ref_kp": ref_kp_count,
+            "tgt_kp": tgt_kp_count,
+            "initial_matches": init_count_l,
+            "good_matches": good_count_l,
+            "inlier_matches": inliers_count_l,
+            "inlier_ratio_pct": inlier_ratio_l,
+            "reprojection_rmse_px": round(rmse_l, 4),
+            "median_error_px": round(med_err_l, 4),
+            "max_error_px": round(max_err_l, 4),
+            "grid_occupancy_pct": grid_occ,
+            "bbox_coverage_pct": spatial_analysis.get("bbox_coverage_pct", 0.0),
+            "spatial_assessment": spatial_analysis.get("assessment", "unknown"),
+            "homography": H_local.tolist() if H_local is not None else None,
+            "processing_time_ms": roi_time,
+            "warped_image": warped_sub_tgt,
+        }
+        roi_results.append(row)
+        status_tag = f"SUCCESS ({inliers_count_l} inliers, {inlier_ratio_l:.1f}%, RMSE: {rmse_l:.2f}px)" if status == "SUCCESS" else f"FAILED - {reason}"
+        print(f"      ROI {i:02d} (Y:{ref_y1:5d}..{ref_y2:5d}): {status_tag}")
+
+    # 4. Evaluate Neighbor Continuity & Suspicious ROIs
+    print("\n[3/4] Evaluating transformation continuity across ROIs ...", flush=True)
+    continuity_report = evaluate_continuity(roi_results)
+    print(f"      Continuity: {continuity_report['neighboring_homography_consistency']} | Max translation jump: {continuity_report['max_translation_jump_px']} px | Suspicious ROIs: {len(continuity_report['suspicious_rois'])}")
+
+    # 5. Overlapping Linear Cross-Fade Mosaic Blending
+    print("\n[4/4] Blending full-strip registered mosaic and rendering artifacts ...", flush=True)
+    final_registered = blend_overlapping_rois(roi_results, h_ref, w_ref, default_overlap=roi_overlap)
+    final_overlay = create_overlay(ref_img, final_registered, alpha=0.5)
+    final_difference = create_difference_image(ref_img, final_registered)
+
+    # Compute Global Spatial Coverage over all inliers
+    if len(all_inlier_pts_ref) > 0:
+        stacked_inliers = np.vstack(all_inlier_pts_ref)
+        full_spatial = analyze_spatial_distribution(stacked_inliers, w_ref, h_ref, grid_rows=8, grid_cols=4)
+        total_inliers_count = len(stacked_inliers)
+    else:
+        full_spatial = analyze_spatial_distribution(np.empty((0, 2)), w_ref, h_ref, grid_rows=8, grid_cols=4)
+        total_inliers_count = 0
+
+    # Save artifacts
+    if save_visualizations:
+        cv2.imwrite(os.path.join(output_dir, "registered.jpg"), final_registered, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2.imwrite(os.path.join(output_dir, "overlay.jpg"), final_overlay, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2.imwrite(os.path.join(output_dir, "difference.jpg"), final_difference, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if len(good_matches_g) > 0 and inlier_mask_g is not None:
+            matches_vis = create_match_visualization(
+                ref_img, tgt_img, kp_ref_g, kp_tgt_g, good_matches_g, inlier_mask_g, spatial_info=full_spatial, rmse=rmse_g
+            )
+            cv2.imwrite(os.path.join(output_dir, "matches.jpg"), matches_vis, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    # Generate Full-Strip Tile Overview
+    create_tile_overview(ref_img, tgt_img, roi_results, os.path.join(output_dir, "tile_overview.jpg"))
+
+
+    # Summary Statistics
+    successful_rois = [r for r in roi_results if r["status"] == "SUCCESS"]
+    success_count = len(successful_rois)
+    failed_count = len(roi_results) - success_count
+
+    mean_inlier_ratio = round(float(np.mean([r["inlier_ratio_pct"] for r in successful_rois])), 2) if success_count > 0 else 0.0
+    median_rmse = round(float(np.median([r["reprojection_rmse_px"] for r in successful_rois])), 4) if success_count > 0 else 0.0
+    mean_rmse = round(float(np.mean([r["reprojection_rmse_px"] for r in successful_rois])), 4) if success_count > 0 else 0.0
+
+    # Calculate Confidence Score (0-100)
+    score_roi = (success_count / max(1, len(roi_results))) * 40.0
+    score_ratio = min(1.0, mean_inlier_ratio / 80.0) * 25.0
+    score_rmse = max(0.0, 1.0 - (median_rmse / 3.0)) * 20.0
+    score_cont = 15.0 if continuity_report["neighboring_homography_consistency"] == "smooth" else (8.0 if continuity_report["neighboring_homography_consistency"] == "moderately_consistent" else 0.0)
+    confidence_score = round(score_roi + score_ratio + score_rmse + score_cont, 1)
+
+    if confidence_score >= 75.0 and failed_count == 0:
+        final_status = "SUCCESS"
+    elif confidence_score >= 50.0:
+        final_status = "REVIEW"
+    else:
+        final_status = "FAILED"
+
+    total_time_ms = round((time.perf_counter() - total_start) * 1000, 2)
+
+    # Compile Structured metrics.json
+    metrics_payload: Dict[str, Any] = {
+        "mode": "hybrid",
+        "global_initialization": {
+            "status": global_init_status,
+            "homography": H_global.tolist() if H_global is not None else None,
+            "inliers": inliers_g_count,
+            "inlier_ratio": inlier_ratio_g,
+            "rmse": round(rmse_g, 4),
+            "estimated_vertical_offset": round(med_dy, 2),
+            "estimated_horizontal_offset": round(med_dx, 2),
+        },
+        "local_registration": {
+            "total_rois": len(roi_results),
+            "successful_rois": success_count,
+            "failed_rois": failed_count,
+            "total_inliers": total_inliers_count,
+            "mean_inlier_ratio": mean_inlier_ratio,
+            "median_rmse": median_rmse,
+            "mean_rmse": mean_rmse,
+            "spatial_coverage": full_spatial.get("bbox_coverage_pct", 0.0),
+            "grid_occupancy": full_spatial.get("grid_occupancy_ratio", 0.0),
+        },
+        "continuity": {
+            "neighboring_homography_consistency": continuity_report["neighboring_homography_consistency"],
+            "max_translation_jump_px": continuity_report["max_translation_jump_px"],
+            "max_rotation_jump_deg": continuity_report["max_rotation_jump_deg"],
+            "suspicious_rois": continuity_report["suspicious_rois"],
+        },
+        "final_quality": {
+            "accepted": (final_status == "SUCCESS"),
+            "confidence_score": confidence_score,
+            "status": final_status,
+        },
+        "parameters": {
+            "roi_height": roi_height,
+            "roi_overlap": roi_overlap,
+            "search_margin": search_margin,
+            "max_features_global": max_features_global,
+            "max_features_roi": max_features_roi,
+            "ratio_threshold": ratio_threshold,
+            "ransac_threshold": ransac_threshold,
+            "matcher_method": matcher_method,
+            "cross_check": cross_check,
+            "min_inliers": min_inliers,
+            "min_inlier_ratio": min_inlier_ratio,
+            "max_rmse": max_rmse,
+        },
+        "processing_time_ms": total_time_ms,
+    }
+
+    save_metrics(metrics_payload, os.path.join(output_dir, "metrics.json"))
+
+    # Save roi_summary.csv
+    csv_path = os.path.join(output_dir, "roi_summary.csv")
+    csv_rows = []
+    for r in roi_results:
+        clean_row = {k: v for k, v in r.items() if k != "warped_image"}
+        csv_rows.append(clean_row)
+    if len(csv_rows) > 0:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(csv_rows)
+
+    print(f"\nSaved hybrid registration metrics and artifacts to: {output_dir}/\n")
+    return (final_status == "SUCCESS"), metrics_payload, roi_results
 
 
 def main() -> None:
@@ -1348,8 +1932,8 @@ def main() -> None:
         "--mode",
         type=str,
         default="global",
-        choices=["global", "roi", "tiles"],
-        help="Registration mode: 'global' for full-image or 'roi'/'tiles' for multi-tile registration (default: global)",
+        choices=["global", "roi", "tiles", "hybrid"],
+        help="Registration mode: 'global' (full-image), 'roi'/'tiles' (multi-tile), or 'hybrid' (coarse-to-fine blended) (default: global)",
     )
     parser.add_argument(
         "--reference",
@@ -1424,7 +2008,7 @@ def main() -> None:
         help="Directory for saving benchmark experiment outputs (default: backend/experiments)",
     )
 
-    # ROI / Tile Mode specific arguments
+    # ROI / Tile / Hybrid Mode arguments
     parser.add_argument(
         "--roi-height",
         type=int,
@@ -1441,7 +2025,7 @@ def main() -> None:
         "--vertical-offset",
         type=float,
         default=-380.0,
-        help="Estimated vertical displacement offset in pixels (default: -380.0)",
+        help="Manual vertical displacement offset for ROI mode in pixels (default: -380.0)",
     )
     parser.add_argument(
         "--search-margin",
@@ -1477,6 +2061,45 @@ def main() -> None:
             target_path=args.target,
             experiments_dir=args.benchmark_dir,
         )
+        return
+
+    # Hybrid Mode
+    if args.mode.lower() == "hybrid":
+        out_dir = "backend/output/hybrid" if args.output_dir == "backend/output" else args.output_dir
+        success, metrics, roi_results = run_hybrid_pipeline(
+            reference_path=args.reference,
+            target_path=args.target,
+            roi_height=args.roi_height,
+            roi_overlap=args.roi_overlap,
+            search_margin=args.search_margin,
+            max_features_global=args.max_features,
+            max_features_roi=1500,
+            ratio_threshold=args.ratio,
+            ransac_threshold=args.ransac_threshold,
+            matcher_method=args.matcher,
+            cross_check=args.cross_check,
+            min_inliers=args.min_inliers,
+            min_inlier_ratio=args.min_inlier_ratio,
+            max_rmse=args.max_rmse,
+            output_dir=out_dir,
+            save_visualizations=True,
+        )
+
+        local_m = metrics["local_registration"]
+        cont_m = metrics["continuity"]
+        qual_m = metrics["final_quality"]
+
+        print("LunaReg Hybrid Registration")
+        print("---------------------------")
+        print(f"Global initialization:   {metrics['global_initialization']['status']}")
+        print(f"Local ROIs:              {local_m['successful_rois']}/{local_m['total_rois']} successful")
+        print(f"Total local inliers:     {local_m['total_inliers']}")
+        print(f"Mean local inlier ratio: {local_m['mean_inlier_ratio']}%")
+        print(f"Median local RMSE:       {local_m['median_rmse']} px")
+        print(f"Spatial coverage:        {local_m['spatial_coverage']}%")
+        print(f"Suspicious ROIs:         {len(cont_m['suspicious_rois'])}")
+        print(f"Confidence Score:        {qual_m['confidence_score']}/100")
+        print(f"Final status:            {qual_m['status']}\n")
         return
 
     # ROI / Tiles Mode

@@ -1,0 +1,67 @@
+{
+  "mode": "hybrid",
+  "global_initialization": {
+    "status": "SUCCESS",
+    "homography": [
+      [
+        0.9141348140069182,
+        -0.016902512652472387,
+        42.17279270364307
+      ],
+      [
+        0.029087951337589537,
+        0.8857251287872673,
+        -1240.3563478188923
+      ],
+      [
+        -1.6509618362254746e-05,
+        -1.6239658455799117e-06,
+        1.0
+      ]
+    ],
+    "inliers": 186,
+    "inlier_ratio": 33.76,
+    "rmse": 1.667,
+    "estimated_vertical_offset": -1676.63,
+    "estimated_horizontal_offset": -97.87
+  },
+  "local_registration": {
+    "total_rois": 5,
+    "successful_rois": 5,
+    "failed_rois": 0,
+    "total_inliers": 713,
+    "mean_inlier_ratio": 48.15,
+    "median_rmse": 1.5593,
+    "mean_rmse": 1.5631,
+    "spatial_coverage": 81.76,
+    "grid_occupancy": 68.75
+  },
+  "continuity": {
+    "neighboring_homography_consistency": "discontinuous",
+    "max_translation_jump_px": 118.95,
+    "max_rotation_jump_deg": 7.8,
+    "suspicious_rois": [
+      5
+    ]
+  },
+  "final_quality": {
+    "accepted": false,
+    "confidence_score": 64.7,
+    "status": "REVIEW"
+  },
+  "parameters": {
+    "roi_height": 2000,
+    "roi_overlap": 500,
+    "search_margin": 500,
+    "max_features_global": 2000,
+    "max_features_roi": 1500,
+    "ratio_threshold": 0.75,
+    "ransac_threshold": 3.0,
+    "matcher_method": "flann",
+    "cross_check": true,
+    "min_inliers": 30,
+    "min_inlier_ratio": 25.0,
+    "max_rmse": 3.0
+  },
+  "processing_time_ms": 5258.47
+}
